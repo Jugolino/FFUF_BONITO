@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+TMP_JSON=""
+
+RED=$'\033[1;31m'
+GREEN=$'\033[1;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[1;34m'
+MAGENTA=$'\033[1;35m'
+CYAN=$'\033[1;36m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+
+usage() {
+  cat <<EOF
+Uso:
+  ./${SCRIPT_NAME} <url> <wordlist> [args extras do ffuf]
+
+Exemplos:
+  ./${SCRIPT_NAME} https://site.com /usr/share/wordlists/dirb/common.txt
+  ./${SCRIPT_NAME} https://site.com/FUZZ lista.txt -fc 404 -t 80
+
+Como funciona:
+  - Se a URL nao tiver FUZZ, o script adiciona /FUZZ automaticamente.
+  - Voce informa apenas URL e wordlist; o resto e opcional.
+  - O resultado e exibido de forma mais limpa no terminal.
+  - Respostas muito repetidas sao separadas como provavel falso positivo.
+EOF
+}
+
+cleanup() {
+  if [[ -n "${TMP_JSON:-}" && -f "${TMP_JSON:-}" ]]; then
+    rm -f "$TMP_JSON"
+  fi
+}
+
+fail() {
+  printf '%s[erro]%s %s\n' "$RED" "$RESET" "$1" >&2
+  exit 1
+}
+
+info() {
+  printf '%s[info]%s %s\n' "$CYAN" "$RESET" "$1"
+}
+
+has_flag() {
+  local short_flag="$1"
+  local long_flag="${2:-}"
+  shift 2 || true
+
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == "$short_flag" ]]; then
+      return 0
+    fi
+    if [[ -n "$long_flag" && "$arg" == "$long_flag" ]]; then
+      return 0
+    fi
+    if [[ "$arg" == "$short_flag="* ]]; then
+      return 0
+    fi
+    if [[ -n "$long_flag" && "$arg" == "$long_flag="* ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+normalize_url() {
+  local url="$1"
+
+  if [[ "$url" == *FUZZ* ]]; then
+    printf '%s\n' "$url"
+    return
+  fi
+
+  if [[ "$url" == */ ]]; then
+    printf '%sFUZZ\n' "$url"
+  else
+    printf '%s/FUZZ\n' "$url"
+  fi
+}
+
+print_summary() {
+  local json_file="$1"
+
+  python3 - "$json_file" <<'PY'
+import json
+import sys
+from collections import Counter, defaultdict
+
+json_path = sys.argv[1]
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+UNDERLINE = "\033[4m"
+COLORS = {
+    "green": "\033[1;32m",
+    "yellow": "\033[1;33m",
+    "red": "\033[1;31m",
+    "blue": "\033[1;34m",
+    "magenta": "\033[1;35m",
+    "cyan": "\033[1;36m",
+    "white": "\033[1;37m",
+}
+
+
+def color_for_status(status: int) -> str:
+    if 200 <= status < 300:
+        return COLORS["green"]
+    if 300 <= status < 400:
+        return COLORS["blue"]
+    if 400 <= status < 500:
+        return COLORS["yellow"]
+    return COLORS["red"]
+
+
+def signature(item: dict) -> tuple[int, int, int, int]:
+    return (
+        item.get("status", 0),
+        item.get("length", 0),
+        item.get("words", 0),
+        item.get("lines", 0),
+    )
+
+
+def size_signature(item: dict) -> tuple[int, int]:
+    return (
+        item.get("status", 0),
+        item.get("length", 0),
+    )
+
+
+def dominant_signatures(results: list[dict]) -> tuple[set[tuple[int, int]], Counter]:
+    signatures = Counter(size_signature(item) for item in results)
+    grouped_by_status: dict[int, Counter] = defaultdict(Counter)
+    for sig, count in signatures.items():
+        grouped_by_status[sig[0]][sig] = count
+
+    total = len(results)
+    false_positive_signatures: set[tuple[int, int]] = set()
+
+    if signatures:
+        global_sig, global_count = signatures.most_common(1)[0]
+        if global_count >= max(5, int(total * 0.10)):
+            false_positive_signatures.add(global_sig)
+
+    for status, status_counter in grouped_by_status.items():
+        status_total = sum(status_counter.values())
+        top_sig, top_count = status_counter.most_common(1)[0]
+        if top_count >= max(4, int(status_total * 0.40)):
+            false_positive_signatures.add(top_sig)
+
+        for sig, count in status_counter.items():
+            if sig in false_positive_signatures:
+                continue
+            if count >= max(6, int(status_total * 0.20)):
+                false_positive_signatures.add(sig)
+
+    return false_positive_signatures, signatures
+
+
+def split_results(results: list[dict]) -> tuple[list[dict], list[dict], Counter]:
+    false_positive_signatures, signatures = dominant_signatures(results)
+
+    valid = []
+    false_positives = []
+    for item in results:
+        if size_signature(item) in false_positive_signatures:
+            false_positives.append(item)
+        else:
+            valid.append(item)
+
+    return valid, false_positives, signatures
+
+
+def sort_results(items: list[dict], signatures: Counter, positives: bool) -> list[dict]:
+    def key(item: dict) -> tuple:
+        sig_count = signatures[size_signature(item)]
+        status = item.get("status", 0)
+        length = item.get("length", 0)
+        url = item.get("url", "")
+        if positives:
+            return (sig_count, status, length, url)
+        return (-sig_count, status, length, url)
+
+    return sorted(items, key=key)
+
+
+def top_size_groups(items: list[dict]) -> list[tuple[tuple[int, int], int]]:
+    counts = Counter(size_signature(item) for item in items)
+    return counts.most_common(5)
+
+
+def section_bar(title: str, color: str) -> None:
+    print(f"\n{color}{BOLD}{'=' * 24} {title} {'=' * 24}{RESET}")
+
+
+def url_color(is_valid: bool) -> str:
+    return COLORS["cyan"] if is_valid else COLORS["red"]
+
+
+def status_badge(status: int) -> str:
+    return f"{color_for_status(status)}[{status}]{RESET}"
+
+
+def print_entry(item: dict, is_valid: bool) -> None:
+    status = item.get("status", 0)
+    length = item.get("length", 0)
+    words = item.get("words", 0)
+    lines = item.get("lines", 0)
+    url = item.get("url", "-")
+    duration = item.get("duration", 0)
+    ms = duration / 1000 if isinstance(duration, (int, float)) else 0
+    marker = f"{COLORS['green']}OK{RESET}" if is_valid else f"{COLORS['red']}FP{RESET}"
+
+    print(f"{marker} {status_badge(status)} {BOLD}{url_color(is_valid)}{url}{RESET}")
+    print(
+        f"   {DIM}size{RESET} {length:<7} "
+        f"{DIM}words{RESET} {words:<6} "
+        f"{DIM}lines{RESET} {lines:<6} "
+        f"{DIM}time{RESET} {ms:.1f}ms"
+    )
+
+
+def print_grouped(title: str, grouped_results: dict[int, list[dict]], title_color: str, is_valid: bool) -> None:
+    section_bar(title, title_color)
+    if not grouped_results:
+        print(f"{DIM}Nenhum item nesta secao.{RESET}")
+        return
+
+    for status in sorted(grouped_results):
+        entries = grouped_results[status]
+        color = color_for_status(status)
+        print(f"\n{color}{BOLD}HTTP {status}{RESET} {DIM}({len(entries)} itens){RESET}")
+        print(f"{DIM}{'-' * 88}{RESET}")
+        for item in entries:
+            print_entry(item, is_valid)
+        print()
+
+
+results = []
+with open(json_path, "r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "status" not in item or "url" not in item:
+            continue
+        results.append(item)
+
+if not results:
+    print(f"{COLORS['yellow']}[!] Nenhum resultado encontrado.{RESET}")
+    sys.exit(0)
+
+valid_results, false_positives, signatures = split_results(results)
+valid_results = sort_results(valid_results, signatures, True)
+false_positives = sort_results(false_positives, signatures, False)
+
+valid_grouped = defaultdict(list)
+for item in valid_results:
+    valid_grouped[item.get("status", 0)].append(item)
+
+false_grouped = defaultdict(list)
+for item in false_positives:
+    false_grouped[item.get("status", 0)].append(item)
+
+top_false_sizes = top_size_groups(false_positives)
+
+print_grouped("PROVAVEIS FALSOS POSITIVOS", false_grouped, COLORS["red"], False)
+print_grouped("POSITIVOS", valid_grouped, COLORS["green"], True)
+
+section_bar("RESUMO", COLORS["magenta"])
+total = len(results)
+valid_total = len(valid_results)
+false_total = len(false_positives)
+for status in sorted(valid_grouped):
+    count = len(valid_grouped[status])
+    color = color_for_status(status)
+    print(f"{COLORS['green']}OK{RESET} {color}HTTP {status}{RESET} {count}")
+for status in sorted(false_grouped):
+    count = len(false_grouped[status])
+    color = color_for_status(status)
+    print(f"{COLORS['red']}FP{RESET} {color}HTTP {status}{RESET} {count}")
+print(f"{COLORS['green']}{BOLD}Positivos:{RESET} {valid_total}")
+print(f"{COLORS['red']}{BOLD}Falsos positivos:{RESET} {false_total}")
+print(f"{BOLD}Total:{RESET} {total}")
+if false_positives:
+    print(f"{DIM}Heuristica: grupos repetidos por status+tamanho sao tratados como falsos positivos.{RESET}")
+if top_false_sizes:
+    print(f"{DIM}Top grupos repetidos (status,size):{RESET}")
+    for (status, length), count in top_false_sizes:
+        color = color_for_status(status)
+        print(f"  {color}HTTP {status}{RESET} size {length} -> {count}")
+if valid_results:
+    print(f"{DIM}Positivos no final e ordenados por grupos de tamanho mais raros primeiro.{RESET}")
+PY
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  if [[ $# -lt 2 ]]; then
+    usage >&2
+    exit 1
+  fi
+
+  command -v ffuf >/dev/null 2>&1 || fail "ffuf nao encontrado no PATH."
+  command -v python3 >/dev/null 2>&1 || fail "python3 nao encontrado no PATH."
+
+  local raw_url="$1"
+  local wordlist="$2"
+  shift 2
+
+  local extra_args=("$@")
+  local default_args=()
+
+  [[ -f "$wordlist" ]] || fail "wordlist nao encontrada: $wordlist"
+
+  local target_url
+  target_url="$(normalize_url "$raw_url")"
+
+  if ! has_flag "-rate" "--rate" "${extra_args[@]}"; then
+    default_args+=("-rate" "12")
+  fi
+
+  if ! has_flag "-p" "--p" "${extra_args[@]}"; then
+    default_args+=("-p" "0.05")
+  fi
+
+  if ! has_flag "-t" "--threads" "${extra_args[@]}"; then
+    default_args+=("-t" "30")
+  fi
+
+  TMP_JSON="$(mktemp)"
+  trap cleanup EXIT
+
+  printf '%s%sFFUF BONITO%s\n' "$BOLD" "$MAGENTA" "$RESET"
+  printf '%sTarget:%s   %s\n' "$BOLD" "$RESET" "$target_url"
+  printf '%sWordlist:%s %s\n' "$BOLD" "$RESET" "$wordlist"
+  if [[ ${#default_args[@]} -gt 0 ]]; then
+    printf '%sDefaults:%s %s\n' "$BOLD" "$RESET" "${default_args[*]}"
+  fi
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    printf '%sExtras:%s   %s\n' "$BOLD" "$RESET" "${extra_args[*]}"
+  fi
+  printf '%s%s\n' "$DIM" "----------------------------------------------------------------" "$RESET"
+
+  info "Executando ffuf..."
+  ffuf \
+    -u "$target_url" \
+    -w "$wordlist" \
+    -json \
+    -noninteractive \
+    "${default_args[@]}" \
+    "${extra_args[@]}" >"$TMP_JSON"
+
+  print_summary "$TMP_JSON"
+}
+
+main "$@"
