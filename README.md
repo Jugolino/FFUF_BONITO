@@ -182,6 +182,3 @@ Repositorio atual:
 https://github.com/Jugolino/FFUF_BONITO
 ```
 
-## Licenca
-
-Se voce quiser publicar isso de forma mais organizada, vale adicionar uma licenca depois, como `MIT`.
