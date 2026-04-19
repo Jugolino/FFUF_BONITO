@@ -45,14 +45,6 @@ Voce precisa ter:
 - `python3`
 - shell `bash`
 
-## Estrutura
-
-```text
-.
-├── script
-├── install.sh
-└── README.md
-```
 
 ## Como Usar
 
